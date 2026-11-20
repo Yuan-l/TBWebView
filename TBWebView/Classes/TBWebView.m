@@ -4,6 +4,7 @@
 //
 
 #import "TBWebView.h"
+#import <TBNetworkManager/TBRequestManager.h>
 
 static void *kProgressKVOContext = &kProgressKVOContext;
 static NSString * const kTitleKVOPath = @"title";
@@ -12,6 +13,8 @@ static NSString * const kTitleKVOPath = @"title";
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) NSMutableSet<NSString *> *handlerNames;
+@property (nonatomic, strong) NSDate *pageLoadStartedAt;
+@property (nonatomic, copy) NSString *pageLoadURL;
 @end
 
 @implementation TBWebView
@@ -94,7 +97,36 @@ static NSString * const kTitleKVOPath = @"title";
     [TBWebView syncSharedCookiesToWebViewStore];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.timeoutInterval = 30;
+    // WKWebView 请求在 WebContent 进程，宿主拿不到分段；但网络页的成败与总耗时
+    // 是业务可见的，按边界样本记。file/data 本地加载不记（无网络传输）。
+    if ([url.scheme.lowercaseString isEqualToString:@"http"] ||
+        [url.scheme.lowercaseString isEqualToString:@"https"]) {
+        self.pageLoadStartedAt = [NSDate date];
+        self.pageLoadURL = url.absoluteString;
+    } else {
+        self.pageLoadStartedAt = nil;
+        self.pageLoadURL = nil;
+    }
     [self.webView loadRequest:request];
+}
+
+/// 网络页加载收口：起点为空说明是本地 HTML / 子框架导航，不记边界样本。
+- (void)recordPageLoadBoundaryWithError:(NSError *)error {
+    if (!self.pageLoadStartedAt || !self.pageLoadURL) { return; }
+    if (error && error.code == NSURLErrorCancelled) {
+        self.pageLoadStartedAt = nil;
+        self.pageLoadURL = nil;
+        return;
+    }
+    NSTimeInterval durationMs = [[NSDate date] timeIntervalSinceDate:self.pageLoadStartedAt] * 1000.0;
+    NSString *url = self.pageLoadURL;
+    self.pageLoadStartedAt = nil;
+    self.pageLoadURL = nil;
+    [TBBusinessMonitor recordExternalRequest:@"webview.page_load"
+                                         url:url
+                                      status:error ? 0 : 200
+                                  durationMs:durationMs
+                                       error:error];
 }
 
 - (void)loadLocalHTMLFile:(NSString *)fileName inBundle:(NSBundle *)bundle {
@@ -159,12 +191,21 @@ static NSString * const kTitleKVOPath = @"title";
     decisionHandler(WKNavigationActionPolicyAllow);
 }
 
+- (void)webView:(WKWebView *)webView didFinishNavigation:(null_unspecified WKNavigation *)navigation {
+    [self recordPageLoadBoundaryWithError:nil];
+}
+
 - (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(null_unspecified WKNavigation *)navigation withError:(NSError *)error {
+    [self recordPageLoadBoundaryWithError:error];
     if (error.code != NSURLErrorCancelled) {
 #ifdef DEBUG
         fprintf(stderr, "[TBWebView] 加载失败: %s\n", error.localizedDescription.UTF8String);
 #endif
     }
+}
+
+- (void)webView:(WKWebView *)webView didFailNavigation:(null_unspecified WKNavigation *)navigation withError:(NSError *)error {
+    [self recordPageLoadBoundaryWithError:error];
 }
 
 #pragma mark - JS 宿主接口

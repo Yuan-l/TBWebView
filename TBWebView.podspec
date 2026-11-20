@@ -21,4 +21,5 @@ Pod::Spec.new do |s|
   s.source_files = 'TBWebView/Classes/**/*'
 
   s.frameworks = 'UIKit', 'WebKit'
+  s.dependency 'TBNetworkManager'
 end
